@@ -1,23 +1,16 @@
-cmake_minimum_required(VERSION 3.20)
-project(quant_lob CXX)
+find_package(Boost REQUIRED COMPONENTS system)
+find_package(OpenSSL REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+add_executable(binance_live_feed
+    src/live/binance_live_feed.cpp
+)
 
-# Core library: the order book
-add_library(lob src/order_book.cpp)
-target_include_directories(lob PUBLIC src)
-target_compile_options(lob PRIVATE -Wall -Wextra -O2)
+target_compile_features(binance_live_feed PRIVATE cxx_std_20)
 
-# Demo program
-add_executable(lob_demo src/main.cpp)
-target_link_libraries(lob_demo PRIVATE lob)
-target_compile_options(lob_demo PRIVATE -Wall -Wextra -O2)
-
-# Unit tests
-enable_testing()
-add_executable(test_order_book tests/test_order_book.cpp)
-target_link_libraries(test_order_book PRIVATE lob)
-target_compile_options(test_order_book PRIVATE -Wall -Wextra)
-add_test(NAME order_book COMMAND test_order_book)
+target_link_libraries(binance_live_feed PRIVATE
+    Boost::system
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+)
