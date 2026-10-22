@@ -2,3 +2,5 @@ build/
 *.exe
 *.o
 .vscode/
+build-binance/
+data/binance_live_snapshots.csv
