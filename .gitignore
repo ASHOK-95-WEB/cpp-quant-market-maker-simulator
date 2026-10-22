@@ -7,3 +7,12 @@ data/binance_live_snapshots.csvdata/binance_local_book.csv
 data/binance_local_book_archive_*.csv
 binance_local_book.exe
 test_local_order_book.exe
+
+# Generated Binance market-data logs
+data/binance_*.csv
+
+# Local source backups
+src/live/*.bak
+
+# Locally compiled executables
+/*.exe
