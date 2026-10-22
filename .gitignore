@@ -22,3 +22,11 @@ data/integrated_paper_trader.csv
 
 # Generated diagnostic logs
 data/*.log
+.env
+.env.*
+*.env
+!.env.example
+secrets/
+*.pem
+*.p12
+*.pfx
