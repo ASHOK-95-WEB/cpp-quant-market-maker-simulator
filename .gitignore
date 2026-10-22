@@ -3,7 +3,8 @@ build/
 *.o
 .vscode/
 build-binance/
-data/binance_live_snapshots.csvdata/binance_local_book.csv
+data/binance_live_snapshots.csv
+data/binance_local_book.csv
 data/binance_local_book_archive_*.csv
 binance_local_book.exe
 test_local_order_book.exe
