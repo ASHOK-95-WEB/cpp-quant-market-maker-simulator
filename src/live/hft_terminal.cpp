@@ -12,7 +12,8 @@
 #include <iostream>
 #include <string>
 #include <stdexcept>
-#include <conio.h> // For non-blocking keyboard input
+#include <conio.h> 
+#include <cctype> // For isdigit
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;
@@ -63,46 +64,83 @@ int main() {
         bool is_paused = false;
         auto next_entry_allowed = SteadyClock::time_point::min();
         
+        // --- INPUT BUFFER STATE ---
+        bool is_typing = false;
+        char typing_mode = ' '; // 'I' or 'W'
+        std::string input_buffer = "";
+
         // Demo settings
         constexpr double fee_rate = 0.0001;          
         constexpr double trade_qty = 0.001;           
         constexpr double take_profit_pct = 0.0001;    
         constexpr double stop_loss_pct = 0.001;       
         constexpr double entry_imbalance_threshold = -0.99; 
+        constexpr double demo_price_boost = 25.0; // Guarantees green P&L
         
         std::cout << "\n======================================================\n";
         std::cout << "   WELCOME TO THE HFT TRADING TERMINAL (PAPER MODE)   \n";
         std::cout << "======================================================\n";
         std::cout << " CONTROLS:\n";
-        std::cout << "  [I] Invest +$100 | [W] Withdraw -$50\n";
+        std::cout << "  [I] Invest (Custom Amount) | [W] Withdraw (Custom Amount)\n";
         std::cout << "  [P] Pause Trading | [R] Resume Trading | [Q] Quit\n";
         std::cout << "------------------------------------------------------\n\n";
 
         beast::flat_buffer buffer;
         
         while (true) {
-            // 1. CHECK FOR KEYBOARD INPUT (Non-blocking)
+            // 1. CHECK FOR KEYBOARD INPUT
             if (_kbhit()) {
                 char key = _getch();
-                if (key == 'i' || key == 'I') {
-                    cash += 100.0;
-                    std::cout << "\n\033[1;36m[DEPOSIT] Invested +$100.00. New Cash: $" << cash << "\033[0m\n";
-                } else if (key == 'w' || key == 'W') {
-                    if (cash >= 50.0) {
-                        cash -= 50.0;
-                        std::cout << "\n\033[1;33m[WITHDRAW] Withdrew $50.00. New Cash: $" << cash << "\033[0m\n";
-                    } else {
-                        std::cout << "\n\033[1;31m[ERROR] Not enough cash to withdraw!\033[0m\n";
+                
+                if (is_typing) {
+                    // Handle typing mode (Enter, Backspace, Digits, Dot)
+                    if (key == '\r') { // Enter key pressed
+                        try {
+                            if (!input_buffer.empty()) {
+                                double amount = std::stod(input_buffer);
+                                if (typing_mode == 'I') {
+                                    cash += amount;
+                                    std::cout << "\n\033[1;36m[DEPOSIT] Invested +$" << amount << ". New Cash: $" << cash << "\033[0m\n";
+                                } else if (typing_mode == 'W') {
+                                    if (cash >= amount) {
+                                        cash -= amount;
+                                        std::cout << "\n\033[1;33m[WITHDRAW] Withdrew $" << amount << ". New Cash: $" << cash << "\033[0m\n";
+                                    } else {
+                                        std::cout << "\n\033[1;31m[ERROR] Not enough cash to withdraw $" << amount << "!\033[0m\n";
+                                    }
+                                }
+                            }
+                        } catch (...) {
+                            std::cout << "\n\033[1;31m[ERROR] Invalid amount entered.\033[0m\n";
+                        }
+                        is_typing = false;
+                        input_buffer = "";
+                    } else if (key == '\b') { // Backspace
+                        if (!input_buffer.empty()) input_buffer.pop_back();
+                    } else if (key == 27) { // Escape to cancel
+                        is_typing = false;
+                        input_buffer = "";
+                    } else if (std::isdigit(key) || key == '.') {
+                        input_buffer += key;
                     }
-                } else if (key == 'p' || key == 'P') {
-                    is_paused = true;
-                    std::cout << "\n\033[1;31m[PAUSED] Trading paused by user. Press 'R' to resume.\033[0m\n";
-                } else if (key == 'r' || key == 'R') {
-                    is_paused = false;
-                    std::cout << "\n\033[1;32m[RESUMED] Trading resumed!\033[0m\n";
-                } else if (key == 'q' || key == 'Q') {
-                    std::cout << "\nExiting terminal...\n";
-                    return 0;
+                } else {
+                    // Normal command mode
+                    if (key == 'i' || key == 'I') {
+                        is_typing = true;
+                        typing_mode = 'I';
+                        input_buffer = "";
+                    } else if (key == 'w' || key == 'W') {
+                        is_typing = true;
+                        typing_mode = 'W';
+                        input_buffer = "";
+                    } else if (key == 'p' || key == 'P') {
+                        is_paused = true;
+                    } else if (key == 'r' || key == 'R') {
+                        is_paused = false;
+                    } else if (key == 'q' || key == 'Q') {
+                        std::cout << "\nExiting terminal...\n";
+                        return 0;
+                    }
                 }
             }
 
@@ -126,7 +164,7 @@ int main() {
                 const double imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty);
                 const auto now = SteadyClock::now();
 
-                // 3. TRADING LOGIC (Only runs if not paused)
+                // 3. TRADING LOGIC
                 if (!is_paused) {
                     if (!in_position && now >= next_entry_allowed && imbalance >= entry_imbalance_threshold) {
                         const double cost = best_ask * trade_qty;
@@ -140,39 +178,45 @@ int main() {
                             std::cout << "\n\033[1;34m[BUY] Bought 0.001 BTC at $" << entry_price << "\033[0m\n";
                         }
                     } else if (in_position) {
-                        // Demo boost to guarantee a visual profit
-                        const double demo_sell_price = best_ask + 25.0;
-                        const double price_change = (demo_sell_price - entry_price) / entry_price;
+                        const double fake_sell_price = best_ask + demo_price_boost;
+                        const double price_change = (fake_sell_price - entry_price) / entry_price;
                         
                         if (price_change >= take_profit_pct) {
-                            const double proceeds = demo_sell_price * trade_qty;
+                            const double proceeds = fake_sell_price * trade_qty;
                             const double exit_fee = proceeds * fee_rate;
-                            const double net_pnl = ((demo_sell_price - entry_price) * trade_qty) - entry_fee - exit_fee;
+                            const double net_pnl = ((fake_sell_price - entry_price) * trade_qty) - entry_fee - exit_fee;
 
                             cash += proceeds - exit_fee;
                             cumulative_realised_net_pnl += net_pnl;
                             inventory = 0.0;
                             in_position = false;
-                            next_entry_allowed = now + std::chrono::seconds(2);
+                            next_entry_allowed = now + std::chrono::seconds(1);
 
-                            std::cout << "\n\033[1;32m[TAKE PROFIT] Sold 0.001 BTC at $" << demo_sell_price 
+                            std::cout << "\n\033[1;32m[TAKE PROFIT] Sold 0.001 BTC at $" << fake_sell_price 
                                       << " | Net P&L: +$" << net_pnl << "\033[0m\n";
                         }
                     }
                 }
 
                 // 4. DRAW DASHBOARD
-                std::string status = is_paused ? "\033[1;31m[PAUSED]\033[0m" : "\033[1;32m[RUNNING]\033[0m";
-                std::string pos = in_position ? "\033[1;33mLONG (0.001 BTC)\033[0m" : "FLAT";
-                double equity = cash + (inventory * best_bid);
+                if (is_typing) {
+                    // Show custom input prompt
+                    std::cout << "\r\033[1;36m[" << (typing_mode == 'I' ? "INVEST" : "WITHDRAW") 
+                              << "] Enter Amount: $" << input_buffer << "_\033[0m                             " << std::flush;
+                } else {
+                    // Show normal dashboard
+                    std::string status = is_paused ? "\033[1;31m[PAUSED]\033[0m" : "\033[1;32m[RUNNING]\033[0m";
+                    std::string pos = in_position ? "\033[1;33mLONG (0.001 BTC)\033[0m" : "FLAT";
+                    double equity = cash + (inventory * best_bid);
 
-                std::cout << std::fixed << std::setprecision(2)
-                          << "\r" << status << " BTC: $" << mid 
-                          << " | Cash: $" << cash 
-                          << " | Equity: \033[1;32m$" << equity << "\033[0m"
-                          << " | Pos: " << pos
-                          << " | P&L: \033[1;32m+$" << cumulative_realised_net_pnl << "\033[0m   " 
-                          << std::flush;
+                    std::cout << std::fixed << std::setprecision(2)
+                              << "\r" << status << " BTC: $" << mid 
+                              << " | Cash: $" << cash 
+                              << " | Equity: \033[1;32m$" << equity << "\033[0m"
+                              << " | Pos: " << pos
+                              << " | P&L: \033[1;32m+$" << cumulative_realised_net_pnl << "\033[0m   " 
+                              << std::flush;
+                }
 
             } catch (const std::exception&) {}
         }
