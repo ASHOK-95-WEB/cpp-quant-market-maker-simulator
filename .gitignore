@@ -16,3 +16,6 @@ src/live/*.bak
 
 # Locally compiled executables
 /*.exe
+
+# Generated integrated paper-trading log
+data/integrated_paper_trader.csv
