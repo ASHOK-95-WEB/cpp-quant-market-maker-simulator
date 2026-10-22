@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(quant_lob LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -49,6 +49,8 @@ set(LIVE_COMMON_LIBS
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ws2_32
+    crypt32
 )
 
 add_executable(binance_live_feed src/live/binance_live_feed.cpp)
