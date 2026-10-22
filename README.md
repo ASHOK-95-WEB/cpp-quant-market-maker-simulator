@@ -266,3 +266,33 @@ financial advice.
 
 
 
+
+## Validation snapshot
+
+### Tests
+- Order-book unit tests: passed.
+- Local synchronized order-book tests: passed.
+- P&L and risk engine: all 22 tests passed.
+
+### Live-data smoke test
+- Connected to the public Binance BTC/USDT market-data stream.
+- Loaded a REST snapshot and synchronized the local order book.
+- Continued receiving market updates during the observed run.
+- No simulated fills were recorded in the examined CSV history.
+
+### Exploratory imbalance analysis
+Using a threshold of +/-0.2 and a forward horizon of 10 recorded rows:
+- Positive imbalance: 446 observations, 82 upward moves, 7 downward moves,
+  357 unchanged observations, mean forward move +$0.4726 per BTC.
+- Negative imbalance: 317 observations, 50 downward moves, 8 upward moves,
+  259 unchanged observations, mean forward move -$0.8490 per BTC.
+- 20 timestamp gaps were skipped by the exploratory analysis.
+
+These statistics are exploratory, not a validated trading backtest. The CSV
+contains repeated runs, adjacent observations overlap, and the analysis does
+not model actual fills, queue position, slippage, or trading costs.
+
+### Limitations
+The paper market maker uses simplified book-touch fill detection. Zero fills
+means the strategy's profitability has not been demonstrated. No claim of
+positive net P&L or live-trading readiness is supported by these results.

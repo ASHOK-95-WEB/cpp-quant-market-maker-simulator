@@ -19,3 +19,6 @@ src/live/*.bak
 
 # Generated integrated paper-trading log
 data/integrated_paper_trader.csv
+
+# Generated diagnostic logs
+data/*.log
