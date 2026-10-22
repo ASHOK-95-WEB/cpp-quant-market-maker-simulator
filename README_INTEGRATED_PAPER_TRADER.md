@@ -44,7 +44,7 @@ These are educational assumptions. The fee rate is **not** a claim about your ac
 
 ## How it works
 
-1. Connect to Binance's public incremental-depth WebSocket stream.
+1. Connect to Binance's public combined incremental-depth and aggregate-trade WebSocket streams.
 2. Buffer depth messages and obtain a public REST depth snapshot.
 3. Ignore messages already covered by the snapshot; the first newer event must bridge the snapshot update ID. Any detected update gap ends that session and starts a fresh snapshot sync.
 4. Calculate mid-price, microprice and five-level depth imbalance.
@@ -55,7 +55,7 @@ These are educational assumptions. The fee rate is **not** a claim about your ac
 ## Critical modelling limits
 
 - **This is not real HFT and it does not guarantee profits.** It is a local paper-trading research prototype.
-- Fills are a simplified *book-touch approximation*: a best-bid/best-ask touch triggers a virtual fill. It does not ingest public trade prints, estimate queue position, or reconstruct matching-engine priority. Consequently, simulated fill rate and P&L are not evidence of executable profitability.
+- Fills are attributed only when a public Binance `aggTrade` print matches the hypothetical limit price and aggressor direction, after estimated same-price displayed queue volume is consumed. This remains approximate: aggregate public prints do not reveal our actual queue priority, hidden liquidity, or all cancellations. When no same-price level is visible, queue-ahead estimate defaults to zero and may be optimistic. `data/trade_print_fill_events.csv` records the trade-print stream and estimated fills separately from the book-state log. Simulated fill rate and P&L are not evidence of executable profitability.
 - Quote widths include the configured fee assumption plus an extra edge. With a 0.10% assumed fee per fill, these quotes may be far from the market and rarely fill; that is preferable to pretending costs are zero.
 - Local read timestamps are not exchange-to-computer latency measurements. Clock skew, network delay and synchronous buffering matter.
 - The book stores prices as `double`, and the REST snapshot contains a limited number of levels. A production-quality implementation should use integer ticks/lot units from exchange metadata, asynchronous bounded buffering, richer recovery logic, trade/queue modelling, slippage, and independent replay/backtest validation.
@@ -73,4 +73,4 @@ g++ -std=c++20 -O2 -Wall -Wextra tests/test_pnl_risk_engine.cpp -o test_pnl_risk
 ./test_pnl_risk_engine.exe
 ```
 
-Then compile the integrated executable. Treat any compiler error as a blocker; don't run it until it builds cleanly. I have packaged the source and build recipe, but this new integrated executable has not been compiled in your Windows/MSYS2 environment yet.
+After applying the trade-print integration, rebuild all targets with `cmake --build build --parallel 2` and run `ctest --test-dir build --output-on-failure`. Verify that the executable connects, writes the trade-print CSV, and reports any simulated fills before interpreting its results. Successful compilation or paper fills do not establish profitability.

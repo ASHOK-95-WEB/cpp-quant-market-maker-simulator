@@ -293,6 +293,9 @@ contains repeated runs, adjacent observations overlap, and the analysis does
 not model actual fills, queue position, slippage, or trading costs.
 
 ### Limitations
-The paper market maker uses simplified book-touch fill detection. Zero fills
-means the strategy's profitability has not been demonstrated. No claim of
-positive net P&L or live-trading readiness is supported by these results.
+The integrated paper market maker now attributes fills from matching public
+Binance `aggTrade` prints and an estimated same-price displayed queue ahead.
+This is still an approximation: hidden liquidity, exact queue priority and
+cancellations cannot be inferred from public aggregate prints. The separate
+`data/trade_print_fill_events.csv` log records trade events and estimated fills.
+Zero or simulated fills do not establish profitability or live-trading readiness.

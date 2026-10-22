@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -67,6 +68,22 @@ public:
     double best_bid_qty() const { return bids_.begin()->second; }
     double best_ask() const { return asks_.begin()->first; }
     double best_ask_qty() const { return asks_.begin()->second; }
+
+    // Estimate pre-existing displayed quantity at an exact hypothetical order price.
+    // A missing level returns zero; hidden liquidity and the true queue remain unknown.
+    double bid_quantity_at_price(double price, double tolerance = 0.001) const {
+        for (const auto& [level_price, quantity] : bids_) {
+            if (std::abs(level_price - price) <= tolerance) return quantity;
+        }
+        return 0.0;
+    }
+
+    double ask_quantity_at_price(double price, double tolerance = 0.001) const {
+        for (const auto& [level_price, quantity] : asks_) {
+            if (std::abs(level_price - price) <= tolerance) return quantity;
+        }
+        return 0.0;
+    }
 
     bool valid_market() const {
         return has_two_sided_book() && best_bid() < best_ask();

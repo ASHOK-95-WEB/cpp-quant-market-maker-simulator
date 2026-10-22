@@ -1,5 +1,6 @@
 #include "local_order_book.hpp"
 #include "paper/pnl_risk_engine.hpp"
+#include "paper/trade_print_fill_model.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -36,7 +37,7 @@ using json = nlohmann::json;
 namespace {
 constexpr const char* kWsHost = "data-stream.binance.vision";
 constexpr const char* kWsPort = "443";
-constexpr const char* kWsTarget = "/ws/btcusdt@depth@100ms";
+constexpr const char* kWsTarget = "/stream?streams=btcusdt@depth@100ms/btcusdt@aggTrade";
 constexpr const char* kRestUrl =
     "https://data-api.binance.vision/api/v3/depth?symbol=BTCUSDT&limit=1000";
 
@@ -65,8 +66,9 @@ struct ReceivedMessage {
 
 struct WorkingOrder {
     double price{0.0};
-    double quantity{0.0};
+    double quantity{0.0}; // remaining quantity
     bool active{false};
+    double queue_ahead_quantity{0.0}; // estimated displayed quantity at this exact price
 };
 
 struct SimulatedFill {
@@ -146,6 +148,20 @@ bool is_depth_event(const json& value) {
            value.contains("b") && value.contains("a");
 }
 
+bool is_agg_trade_event(const json& value) {
+    return value.is_object() && value.value("e", std::string{}) == "aggTrade" &&
+           value.contains("p") && value.contains("q") && value.contains("m");
+}
+
+paper::TradePrint parse_trade_print(const json& value) {
+    const bool buyer_is_maker = value.at("m").get<bool>();
+    const paper::AggressorSide aggressor = buyer_is_maker
+        ? paper::AggressorSide::Sell
+        : paper::AggressorSide::Buy;
+    return paper::TradePrint{
+        json_number(value.at("p")), json_number(value.at("q")), aggressor};
+}
+
 DepthEvent parse_event(const json& value) {
     DepthEvent event;
     event.first_update_id = value.at("U").get<std::uint64_t>();
@@ -166,6 +182,9 @@ ReceivedMessage read_message(
     // Timestamp directly after the complete WebSocket frame arrives, before JSON parsing.
     const auto local_ms = system_time_ms();
     json payload = json::parse(beast::buffers_to_string(buffer.data()));
+    // Combined Binance streams wrap each raw event in {"stream":"...","data":{...}}.
+    if (payload.is_object() && payload.contains("data") && payload.at("data").is_object())
+        payload = payload.at("data");
     return ReceivedMessage{std::move(payload), local_ms};
 }
 
@@ -173,39 +192,90 @@ double round_to_cent(double price) {
     return std::round(price * 100.0) / 100.0;
 }
 
-// Order-book-only touch model: intentionally an approximation, not a queue-position simulator.
-SimulatedFill try_simulated_fill(const LocalOrderBook& book,
-                                 WorkingOrder& bid_order,
-                                 WorkingOrder& ask_order,
-                                 paper::Ledger& ledger) {
-    SimulatedFill fill;
-    if (!book.valid_market()) return fill;
-
-    // A bid fill is inferred when the visible best bid touches/goes below our resting limit.
-    // An ask fill is inferred when the visible best ask touches/goes above our resting limit.
-    // Depth alone cannot prove a specific queue fill; this assumption is disclosed in the README.
-    if (bid_order.active && book.best_bid() <= bid_order.price) {
-        const double qty = bid_order.quantity;
-        const double fee_cost = bid_order.price * qty * (1.0 + ledger.fee_rate());
-        if (ledger.inventory() + qty <= kMaxLongInventoryBtc + 1e-12 &&
-            ledger.cash() + 1e-9 >= fee_cost) {
-            ledger.apply_fill(paper::Side::Buy, bid_order.price, qty);
-            fill = {"BUY", bid_order.price, qty};
-        }
-        bid_order.active = false;
-    }
-
-    if (fill.side == "NONE" && ask_order.active &&
-        book.best_ask() >= ask_order.price && ledger.inventory() + 1e-12 >= ask_order.quantity) {
-        const double qty = ask_order.quantity;
-        ledger.apply_fill(paper::Side::Sell, ask_order.price, qty);
-        fill = {"SELL", ask_order.price, qty};
-        ask_order.active = false;
-    }
-    return fill;
+paper::RestingOrder to_model_order(const WorkingOrder& order, paper::RestingSide side) {
+    return paper::RestingOrder{side, order.price, order.quantity, order.quantity,
+                               order.queue_ahead_quantity, 0.0, order.active};
 }
 
-void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstream& csv) {
+void store_model_order(WorkingOrder& target, const paper::RestingOrder& source) {
+    target.quantity = source.remaining_quantity;
+    target.queue_ahead_quantity = source.queue_ahead_quantity;
+    target.active = source.active;
+}
+
+// Fills are inferred only from public aggTrade prints at the hypothetical limit price.
+// Same-price displayed depth is an estimate of queue ahead, not exchange queue certainty.
+SimulatedFill try_trade_print_fill(const paper::TradePrint& trade,
+                                   const LocalOrderBook& book,
+                                   WorkingOrder& bid_order,
+                                   WorkingOrder& ask_order,
+                                   paper::Ledger& ledger,
+                                   paper::RiskManager& risk,
+                                   bool feed_fresh,
+                                   std::string& risk_status) {
+    if (risk.halted()) {
+        bid_order.active = false;
+        ask_order.active = false;
+        risk_status = "KILL_SWITCH_MAX_LOSS";
+        return {};
+    }
+    if (!feed_fresh) {
+        bid_order.active = false;
+        ask_order.active = false;
+        risk_status = "STALE_FEED_QUOTES_CANCELLED";
+        return {};
+    }
+    if (!book.valid_market()) {
+        bid_order.active = false;
+        ask_order.active = false;
+        risk_status = "INVALID_BOOK_QUOTES_CANCELLED";
+        return {};
+    }
+
+    const paper::MarketState market{
+        book.best_bid(), book.best_ask(), true, feed_fresh};
+    auto attempt = [&](WorkingOrder& working,
+                       paper::RestingSide resting_side,
+                       paper::Side ledger_side) -> SimulatedFill {
+        if (!working.active) return {};
+
+        paper::RestingOrder model = to_model_order(working, resting_side);
+        const paper::FillDelta delta = paper::apply_trade_print(model, trade, 0.001);
+        if (!delta) {
+            // Commit any queue-ahead depletion even if this print did not fill us.
+            store_model_order(working, model);
+            return {};
+        }
+
+        const paper::OrderIntent fill_intent{ledger_side, delta.price, delta.quantity};
+        const paper::RiskDecision decision = risk.check(fill_intent, market, ledger);
+        if (risk.halted()) {
+            working.active = false;
+            bid_order.active = false;
+            ask_order.active = false;
+            risk_status = "KILL_SWITCH_MAX_LOSS";
+            return {};
+        }
+        if (!decision.allowed) {
+            working.active = false;
+            risk_status = "TRADE_FILL_REJECTED_" + decision.reason;
+            return {};
+        }
+
+        store_model_order(working, model);
+        ledger.apply_fill(ledger_side, delta.price, delta.quantity);
+        risk_status = "TRADE_PRINT_FILL";
+        return SimulatedFill{
+            ledger_side == paper::Side::Buy ? "BUY" : "SELL",
+            delta.price, delta.quantity};
+    };
+
+    // Binance aggTrade m=true means buyer was maker, so the aggressor was a seller.
+    if (trade.aggressor == paper::AggressorSide::Sell)
+        return attempt(bid_order, paper::RestingSide::Buy, paper::Side::Buy);
+    return attempt(ask_order, paper::RestingSide::Sell, paper::Side::Sell);
+}
+void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstream& csv, std::ofstream& trade_csv) {
     net::io_context ioc;
     ssl::context tls_context(ssl::context::tls_client);
     tls_context.set_default_verify_paths();
@@ -224,7 +294,7 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
     beast::get_lowest_layer(ws).expires_never();
     beast::flat_buffer ws_buffer;
 
-    std::cout << "Connected to public Binance incremental depth stream; buffering for snapshot sync...\n";
+    std::cout << "Connected to public Binance depth + aggTrade streams; buffering depth for snapshot sync...\n";
     std::vector<ReceivedMessage> buffered;
     buffered.reserve(kInitialBufferedEvents);
     while (buffered.size() < kInitialBufferedEvents) {
@@ -268,7 +338,7 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
             working_ask.active = false;
             risk_status = "INVALID_BOOK_QUOTES_CANCELLED";
         } else {
-            fill = try_simulated_fill(book, working_bid, working_ask, ledger);
+            // No depth-touch fills: a virtual order fills only after a matching public aggTrade print.
 
             const double mid = book.mid_price();
             const double imbalance = book.depth_imbalance(5);
@@ -292,7 +362,7 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
                 if (bid_decision.allowed) {
                     if (!working_bid.active ||
                         std::abs(working_bid.price - desired_bid) > reprice_threshold) {
-                        working_bid = WorkingOrder{desired_bid, kOrderQtyBtc, true};
+                        working_bid = WorkingOrder{desired_bid, kOrderQtyBtc, true, book.bid_quantity_at_price(desired_bid)};
                     }
                 } else {
                     working_bid.active = false;
@@ -314,7 +384,8 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
                             std::abs(working_ask.price - desired_ask) > reprice_threshold ||
                             working_ask.quantity > ledger.inventory() + 1e-12) {
                             working_ask = WorkingOrder{
-                                desired_ask, std::min(kOrderQtyBtc, ledger.inventory()), true};
+                                desired_ask, std::min(kOrderQtyBtc, ledger.inventory()), true,
+                                book.ask_quantity_at_price(desired_ask)};
                         }
                     } else {
                         working_ask.active = false;
@@ -379,6 +450,49 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
         }
     };
 
+    std::size_t trade_print_count = 0;
+    std::size_t simulated_fill_count = 0;
+    auto process_trade = [&](const ReceivedMessage& received, const json& trade_payload) {
+        const paper::TradePrint trade = parse_trade_print(trade_payload);
+        const bool feed_fresh = received.local_receive_ms > 0 &&
+            system_time_ms() >= received.local_receive_ms &&
+            (system_time_ms() - received.local_receive_ms) <= kFeedFreshMs;
+        std::string trade_risk_status = "OK";
+        const SimulatedFill fill = try_trade_print_fill(
+            trade, book, working_bid, working_ask, ledger, risk,
+            feed_fresh, trade_risk_status);
+        const paper::PortfolioMark mark = ledger.mark_to_market(last_valid_mark_bid);
+        const std::int64_t event_time_ms = trade_payload.value(
+            "T", trade_payload.value("E", std::int64_t{0}));
+        const char* aggressor = trade.aggressor == paper::AggressorSide::Buy ? "BUY" : "SELL";
+
+        trade_csv << received.local_receive_ms << ',' << event_time_ms << ','
+                  << std::setprecision(12) << trade.price << ',' << trade.quantity << ','
+                  << aggressor << ','
+                  << (working_bid.active ? working_bid.price : 0.0) << ','
+                  << working_bid.queue_ahead_quantity << ','
+                  << (working_ask.active ? working_ask.price : 0.0) << ','
+                  << working_ask.queue_ahead_quantity << ','
+                  << fill.side << ',' << fill.price << ',' << fill.quantity << ','
+                  << mark.cash << ',' << mark.inventory << ',' << mark.net_pnl << ','
+                  << mark.realised_net_pnl << ',' << mark.fees_paid << ','
+                  << mark.current_drawdown << ',' << std::quoted(trade_risk_status) << '\n';
+
+        ++trade_print_count;
+        if (fill.side != "NONE") {
+            ++simulated_fill_count;
+            std::cout << "[TRADE-PRINT PAPER FILL] " << fill.side << ' '
+                      << fill.quantity << " BTC @ " << std::fixed << std::setprecision(2)
+                      << fill.price << " | inventory " << std::setprecision(4)
+                      << mark.inventory << " BTC | net P&L $" << mark.net_pnl << '\n';
+        }
+        if (trade_print_count % 100 == 0) trade_csv.flush();
+        if (trade_print_count % 1000 == 0) {
+            std::cout << "Observed aggTrade prints: " << trade_print_count
+                      << " | paper fills: " << simulated_fill_count << '\n';
+        }
+    };
+
     std::cout << "Snapshot loaded at update ID " << snapshot.last_update_id << ".\n"
               << "Seeking first event that bridges snapshot update ID...\n";
     bool synchronized = false;
@@ -410,7 +524,7 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
         apply_received(received);
     }
 
-    std::cout << "SYNCHRONIZED local book is live. Logging to data/integrated_paper_trader.csv.\n"
+    std::cout << "SYNCHRONIZED local book is live. Logging book state to data/integrated_paper_trader.csv and trade events to data/trade_print_fill_events.csv.\n"
               << "Paper only: no API keys, accounts, or real orders. Ctrl+C to stop.\n";
 
     // Replay the remainder of the initial buffer in sequence order, then continue live.
@@ -430,6 +544,10 @@ void run_one_session(paper::Ledger& ledger, paper::RiskManager& risk, std::ofstr
         try {
             received = read_message(ws, ws_buffer);
         } catch (const json::exception&) {
+            continue;
+        }
+        if (is_agg_trade_event(received.payload)) {
+            process_trade(received, received.payload);
             continue;
         }
         if (!is_depth_event(received.payload)) continue;
@@ -468,6 +586,25 @@ int main() {
         csv.flush();
     }
 
+    const std::string trade_csv_path = "data/trade_print_fill_events.csv";
+    const bool trade_csv_needs_header = !std::filesystem::exists(trade_csv_path) ||
+        std::filesystem::file_size(trade_csv_path) == 0;
+    std::ofstream trade_csv(trade_csv_path, std::ios::app);
+    if (!trade_csv) {
+        std::cerr << "Cannot open " << trade_csv_path << '\n';
+        csv.close();
+        curl_global_cleanup();
+        return 1;
+    }
+    if (trade_csv_needs_header) {
+        trade_csv << "local_receive_ms,event_time_ms,trade_price,trade_qty,aggressor_side,"
+                     "working_bid_price,bid_queue_ahead_after_btc,working_ask_price,"
+                     "ask_queue_ahead_after_btc,fill_side,fill_price,fill_qty,cash_usd,"
+                     "inventory_btc,net_pnl_usd,realised_net_pnl_usd,fees_paid_usd,"
+                     "current_drawdown_usd,risk_status\n";
+        trade_csv.flush();
+    }
+
     try {
         paper::Ledger ledger(kInitialCashUsd, kIllustrativeFeeRate);
         paper::RiskConfig config;
@@ -483,13 +620,14 @@ int main() {
                   << "Order quantity: " << kOrderQtyBtc << " BTC"
                   << " | max inventory: " << kMaxLongInventoryBtc << " BTC"
                   << " | max loss: $" << kMaxLossUsd << "\n"
-                  << "Quotes target assumed round-trip fees plus an extra edge; fill detection is a simplified book-touch model.\n";
+                  << "Quotes target assumed fees plus an extra edge; simulated fills require matching public aggTrade prints.\n";
 
         while (true) {
             try {
-                run_one_session(ledger, risk, csv);
+                run_one_session(ledger, risk, csv, trade_csv);
             } catch (const std::exception& e) {
                 csv.flush();
+                trade_csv.flush();
                 std::cerr << "Feed/session reset: " << e.what()
                           << "\nReconnecting and rebuilding the local book in 2 seconds...\n";
                 std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -501,6 +639,7 @@ int main() {
     } catch (const std::exception& e) {
         std::cerr << "Fatal initialization error: " << e.what() << '\n';
         csv.close();
+        trade_csv.close();
         curl_global_cleanup();
         return 1;
     }
@@ -508,6 +647,8 @@ int main() {
     // The long-running loop normally exits only by user interruption.
     csv.flush();
     csv.close();
+    trade_csv.flush();
+    trade_csv.close();
     curl_global_cleanup();
     return 0;
 }

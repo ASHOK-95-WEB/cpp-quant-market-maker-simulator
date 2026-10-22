@@ -31,3 +31,6 @@ secrets/
 *.pem
 *.p12
 *.pfx
+
+# Generated trade-print paper-execution log
+data/trade_print_fill_events.csv

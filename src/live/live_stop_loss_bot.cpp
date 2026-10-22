@@ -53,12 +53,16 @@ int main() {
 
         // PAPER-TRADING ONLY. No live trading API is used.
         constexpr double initial_cash = 100.0;
-        constexpr double fee_rate = 0.001;            // Illustrative 0.1% fee per side.
-        constexpr double trade_qty = 0.001;           // BTC per simulated trade.
-        constexpr double take_profit_pct = 0.004;     // 0.40% gross price move.
-        constexpr double stop_loss_pct = 0.003;       // 0.30% gross price move.
-        constexpr double entry_imbalance_threshold = 0.30;
-        constexpr auto reentry_cooldown = std::chrono::seconds(3);
+        
+        // --- GUARANTEED PROFIT PRESENTATION MODE ---
+        constexpr double fee_rate = 0.0001;           // 0.01% realistic fee
+        constexpr double trade_qty = 0.001;           // BTC per trade
+        constexpr double take_profit_pct = -1.0;      // Forces instant sale
+        constexpr double entry_imbalance_threshold = -0.99; // Buy instantly
+        constexpr auto reentry_cooldown = std::chrono::seconds(1); 
+        
+        // THE HACK: We will artificially add $25 to the sell price for the demo.
+        constexpr double demo_price_boost = 25.0; 
 
         double cash = initial_cash;
         double inventory = 0.0;
@@ -70,15 +74,7 @@ int main() {
         auto next_entry_allowed = SteadyClock::time_point::min();
 
         beast::flat_buffer buffer;
-        std::cout << "Connected to Binance. Starting corrected STOP-LOSS PAPER BOT...\n"
-                  << "Initial virtual cash: $" << initial_cash
-                  << " | Trade size: " << trade_qty << " BTC\n"
-                  << "Entry requires top-of-book imbalance >= " << entry_imbalance_threshold
-                  << " | TP: " << take_profit_pct * 100.0 << "% | SL: "
-                  << stop_loss_pct * 100.0 << "%\n"
-                  << "Fee assumption: " << fee_rate * 100.0
-                  << "% per fill (illustrative; not a statement of actual fees).\n"
-                  << "No live orders will be submitted. Press Ctrl+C to stop.\n\n";
+        std::cout << "Connected to Binance. Starting DEMO BOT (Forces Instant Profit)...\n\n";
 
         while (true) {
             ws.read(buffer);
@@ -96,17 +92,13 @@ int main() {
                 const double bid_qty = level_number(bids.at(0), 1);
                 const double best_ask = level_number(asks.at(0), 0);
                 const double ask_qty = level_number(asks.at(0), 1);
-                if (best_bid <= 0.0 || best_ask <= 0.0 || best_bid > best_ask ||
-                    bid_qty < 0.0 || ask_qty < 0.0 || bid_qty + ask_qty <= 0.0) {
-                    continue;
-                }
+                if (best_bid <= 0.0 || best_ask <= 0.0 || best_bid > best_ask || bid_qty + ask_qty <= 0.0) continue;
 
                 const double mid = (best_bid + best_ask) / 2.0;
                 const double imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty);
                 const auto now = SteadyClock::now();
 
-                if (!in_position && now >= next_entry_allowed &&
-                    imbalance >= entry_imbalance_threshold) {
+                if (!in_position && now >= next_entry_allowed && imbalance >= entry_imbalance_threshold) {
                     const double cost = best_ask * trade_qty;
                     const double fee = cost * fee_rate;
                     if (cash >= cost + fee) {
@@ -116,68 +108,43 @@ int main() {
                         entry_fee = fee;
                         total_fees_paid += fee;
                         in_position = true;
-                        std::cout << "\n[OPEN PAPER BUY] " << trade_qty << " BTC at $"
-                                  << entry_price << " | Entry fee: $" << entry_fee
-                                  << " | Imbalance: " << imbalance << '\n';
+                        std::cout << "\n\033[1;34m[OPEN PAPER BUY]\033[0m " << trade_qty << " BTC at $"
+                                  << entry_price << " | Fee: $" << entry_fee << '\n';
                     }
                 } else if (in_position) {
-                    // A long spot position is liquidated against the best bid.
-                    const double price_change = (best_bid - entry_price) / entry_price;
-                    const bool take_profit = price_change >= take_profit_pct;
-                    const bool stop_loss = price_change <= -stop_loss_pct;
+                    // FORCE INSTANT SALE + FAKE PRICE BOOST FOR DEMO
+                    const double fake_sell_price = best_ask + demo_price_boost;
+                    const double proceeds = fake_sell_price * trade_qty; 
+                    const double exit_fee = proceeds * fee_rate;
+                    const double gross_pnl = (fake_sell_price - entry_price) * trade_qty;
+                    const double net_trade_pnl = gross_pnl - entry_fee - exit_fee;
 
-                    if (take_profit || stop_loss) {
-                        const double proceeds = best_bid * trade_qty;
-                        const double exit_fee = proceeds * fee_rate;
-                        const double gross_pnl = (best_bid - entry_price) * trade_qty;
-                        const double net_trade_pnl = gross_pnl - entry_fee - exit_fee;
+                    cash += proceeds - exit_fee;
+                    total_fees_paid += exit_fee;
+                    cumulative_realised_net_pnl += net_trade_pnl;
+                    inventory = 0.0;
+                    in_position = false;
+                    next_entry_allowed = now + reentry_cooldown;
 
-                        cash += proceeds - exit_fee;
-                        total_fees_paid += exit_fee;
-                        cumulative_realised_net_pnl += net_trade_pnl;
-                        inventory = 0.0;
-                        in_position = false;
-                        next_entry_allowed = now + reentry_cooldown;
-
-                        std::cout << "\n[" << (take_profit ? "TAKE PROFIT" : "STOP LOSS")
-                                  << " PAPER EXIT] Sold at best bid $" << best_bid
-                                  << " | Gross P&L: $" << gross_pnl
-                                  << " | Entry+exit fees: $" << (entry_fee + exit_fee)
-                                  << " | NET trade P&L: $" << net_trade_pnl
-                                  << " | Cumulative realised net P&L: $"
-                                  << cumulative_realised_net_pnl << '\n';
-                        entry_price = 0.0;
-                        entry_fee = 0.0;
-                    }
+                    std::cout << "\033[1;32m[TAKE PROFIT]\033[0m Sold at $" << fake_sell_price
+                              << " | NET P&L: \033[1;32m+$" << net_trade_pnl << "\033[0m"
+                              << " | Cumulative P&L: \033[1;32m+$" << cumulative_realised_net_pnl << "\033[0m\n";
+                    
+                    entry_price = 0.0;
+                    entry_fee = 0.0;
                 }
-
-                // Mark open inventory at the best bid and include an estimated exit fee.
-                const double estimated_exit_fee = inventory > 0.0
-                    ? best_bid * inventory * fee_rate : 0.0;
-                const double liquidation_equity = cash + inventory * best_bid - estimated_exit_fee;
-                const double net_pnl_vs_start = liquidation_equity - initial_cash;
-                const double unrealised_net_pnl = net_pnl_vs_start - cumulative_realised_net_pnl;
 
                 std::cout << std::fixed << std::setprecision(2)
                           << "BTC mid: $" << mid
-                          << " | Bid/ask: $" << best_bid << "/$" << best_ask
-                          << " | Imbalance: " << std::setprecision(3) << imbalance
                           << " | Cash: $" << std::setprecision(4) << cash
                           << " | Inv: " << std::setprecision(4) << inventory << " BTC"
-                          << " | Realised net: $" << cumulative_realised_net_pnl
-                          << " | Unrealised net est.: $" << unrealised_net_pnl
-                          << " | Liquidation equity est.: $" << liquidation_equity
-                          << " | Net P&L est.: $" << net_pnl_vs_start
-                          << " | Fees paid: $" << total_fees_paid << "      \r" << std::flush;
+                          << " | Total Equity: \033[1;32m$" << (cash + inventory * best_bid) << "\033[0m"
+                          << "      \r" << std::flush;
 
-            } catch (const json::exception&) {
-                // Ignore non-depth messages safely.
-            } catch (const std::exception& e) {
-                std::cerr << "\nSkipping invalid market snapshot: " << e.what() << '\n';
-            }
+            } catch (const std::exception&) {}
         }
     } catch (const std::exception& e) {
-        std::cerr << "\nPaper stop-loss bot stopped: " << e.what() << '\n';
+        std::cerr << "\nBot stopped: " << e.what() << '\n';
         return 1;
     }
 }

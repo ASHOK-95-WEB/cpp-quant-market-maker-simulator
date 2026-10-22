@@ -22,6 +22,9 @@ int main() {
     assert(near(book.best_ask(), 101.0));
     assert(near(book.spread(), 1.0));
     assert(near(book.mid_price(), 100.5));
+    assert(near(book.bid_quantity_at_price(100.0), 2.0));
+    assert(near(book.ask_quantity_at_price(101.0), 4.0));
+    assert(near(book.bid_quantity_at_price(98.0), 0.0));
 
     // Old update must not change the book.
     DepthEvent old_event{90, 100, 0, {{100.0, 999.0}}, {}};
