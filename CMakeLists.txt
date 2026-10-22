@@ -43,6 +43,14 @@ add_executable(test_pnl_risk_engine tests/test_pnl_risk_engine.cpp)
 quant_enable_warnings(test_pnl_risk_engine)
 add_test(NAME pnl_risk_engine COMMAND test_pnl_risk_engine)
 
+# Isolated unit-tested approximation for passive fills inferred from trade prints.
+add_executable(test_trade_print_fill_model tests/test_trade_print_fill_model.cpp)
+target_include_directories(test_trade_print_fill_model PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/live/paper"
+)
+quant_enable_warnings(test_trade_print_fill_model)
+add_test(NAME trade_print_fill_model COMMAND test_trade_print_fill_model)
+
 # Shared libraries for public Binance market-data applications
 set(LIVE_COMMON_LIBS
     Boost::system
